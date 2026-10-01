@@ -11,16 +11,16 @@
   body{background:radial-gradient(circle at top,#1e293b,#0f172a 60%); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:16px;}
   .wrap{max-width:640px; margin:0 auto;}
-  header{display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;}
+  header{display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px;}
   h1{font-size:22px; margin:0;}
   .code{font-size:26px; font-weight:800; letter-spacing:4px; color:var(--accent);}
-  .copy{font-size:12px; color:var(--muted); cursor:pointer; text-decoration:underline;}
+  .copy{font-size:12px; color:var(--muted); cursor:pointer; text-decoration:underline; text-align:right;}
   .panel{background:var(--panel); border-radius:16px; padding:16px; margin-bottom:14px; box-shadow:0 10px 30px rgba(0,0,0,.4);}
   .panel h2{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin:0 0 10px;}
   ul{list-style:none; margin:0; padding:0;}
   li{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #334155;}
   li:last-child{border-bottom:none;}
-  .dot{width:10px;height:10px;border-radius:50%; background:var(--ok);}
+  .dot{width:10px;height:10px;border-radius:50%; background:var(--ok); flex:0 0 auto;}
   .dot.off{background:var(--danger);}
   .name{flex:1; font-weight:600;}
   .host{font-size:11px; background:var(--accent); color:#0f172a; padding:2px 8px; border-radius:20px; font-weight:700;}
@@ -31,6 +31,17 @@
   .status{font-size:13px; color:var(--muted); text-align:center; margin-top:8px;}
   .mic-row{display:flex; align-items:center; gap:10px; margin-top:8px; font-size:13px; color:var(--muted);}
   .mic-row input{width:auto;}
+  .rounds-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  .rounds-row .lbl{color:var(--muted); font-size:13px;}
+  .chips{display:flex; gap:6px;}
+  .chip{
+    width:auto; padding:8px 16px; border-radius:10px;
+    background:#0f172a; color:var(--text);
+    border:1px solid #334155; font-weight:700;
+    cursor:pointer; font-size:14px; margin-top:0;
+  }
+  .chip.active{background:var(--accent); color:#0f172a; border-color:var(--accent);}
+  .chip:disabled{opacity:.5; cursor:not-allowed;}
 </style>
 </head>
 <body>
@@ -46,6 +57,19 @@
     <div class="panel">
       <h2>Players (<span id="count">0</span>/10)</h2>
       <ul id="players"></ul>
+    </div>
+
+    <div class="panel">
+      <h2>Game settings</h2>
+      <div class="rounds-row">
+        <span class="lbl">Rounds:</span>
+        <div class="chips" id="roundChips">
+          <button class="chip" data-rounds="3">3</button>
+          <button class="chip" data-rounds="5">5</button>
+          <button class="chip" data-rounds="7">7</button>
+        </div>
+      </div>
+      <div class="status" id="roundHint">Host selects. Each player draws once per round.</div>
     </div>
 
     <div class="panel">
@@ -86,8 +110,11 @@ if(!playerId){
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const wsUrl = `${proto}://${location.host}/ws/${roomCode}/${playerId}`;
 let ws;
+let currentHostId = null;
+let lastPlayers = [];
+let selectedRounds = 3;
 
-/* ---------- Voice setup ---------- */
+/* ---------- Voice ---------- */
 let voice = null;
 function initVoice(){
   voice = new Voice({
@@ -114,6 +141,7 @@ function connect(){
     setStatus('Connected');
     ws.send(JSON.stringify({type:'join', name}));
     if(!voice) initVoice();
+    else voice.ws = ws;
   });
   ws.addEventListener('close', ()=>{
     setStatus('Disconnected — reconnecting…');
@@ -126,6 +154,8 @@ function connect(){
 }
 
 function renderPlayers(players, hostId){
+  currentHostId = hostId;
+  lastPlayers = players;
   $('count').textContent = players.length;
   const ul = $('players'); ul.innerHTML = '';
   players.forEach(p=>{
@@ -141,17 +171,40 @@ function renderPlayers(players, hostId){
   const isHost = hostId === playerId;
   if(isHost){
     startBtn.disabled = players.length < 2;
-    startBtn.textContent = players.length < 2 ? 'Need 2+ players' : 'Start Game';
+    startBtn.textContent = players.length < 2
+      ? 'Need 2+ players'
+      : `Start Game (${players.length} players)`;
   }else{
     startBtn.disabled = true;
     startBtn.textContent = 'Waiting for host…';
   }
+  refreshRoundChips();
   if(voice) voice.setPeers(players);
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-let lastPlayers = [];
+/* ---------- Rounds picker ---------- */
+const roundChips = document.querySelectorAll('#roundChips .chip');
+function refreshRoundChips(){
+  const isHost = currentHostId === playerId;
+  roundChips.forEach(ch => {
+    ch.disabled = !isHost;
+    ch.classList.toggle('active', parseInt(ch.dataset.rounds,10) === selectedRounds);
+  });
+  $('roundHint').textContent = isHost
+    ? 'You are the host — pick rounds, then start.'
+    : `Host picked ${selectedRounds} rounds.`;
+}
+roundChips.forEach(ch => {
+  ch.addEventListener('click', () => {
+    if(currentHostId !== playerId) return;
+    selectedRounds = parseInt(ch.dataset.rounds, 10);
+    refreshRoundChips();
+    if(ws && ws.readyState === 1) ws.send(JSON.stringify({type:'set_rounds', rounds:selectedRounds}));
+  });
+});
+
 function handle(msg){
   switch(msg.type){
     case 'welcome':
@@ -161,7 +214,7 @@ function handle(msg){
       setStatus('Reconnected');
       break;
     case 'room_state':
-      lastPlayers = msg.players;
+      if(typeof msg.total_rounds === 'number') selectedRounds = msg.total_rounds;
       renderPlayers(msg.players, msg.host_id);
       break;
     case 'voice_signal':
@@ -178,27 +231,21 @@ function handle(msg){
     case 'game_starting':
       setStatus('Starting game…');
       sessionStorage.setItem('scribble_player_id', playerId);
-      // Keep mic enabled across navigation by noting intent in sessionStorage
       if(voice && voice.enabled) sessionStorage.setItem('scribble_mic', '1');
       setTimeout(()=>{ location.href = '/game?room=' + roomCode; }, 400);
       break;
   }
 }
-let currentHostId = null;
-// capture host id from room_state
-const _h = handle;
-handle = function(msg){
-  if(msg.type === 'room_state') currentHostId = msg.host_id;
-  _h(msg);
-};
 
 $('startBtn').addEventListener('click', ()=>{
-  if(ws && ws.readyState === 1) ws.send(JSON.stringify({type:'start_game'}));
+  if(ws && ws.readyState === 1)
+    ws.send(JSON.stringify({type:'start_game', rounds: selectedRounds}));
 });
 
 /* ---------- Mic toggle ---------- */
 const micToggle = $('micToggle');
 micToggle.addEventListener('change', async (e)=>{
+  if(!voice) initVoice();
   if(e.target.checked){
     const ok = await voice.enable();
     if(!ok) e.target.checked = false;
@@ -207,16 +254,15 @@ micToggle.addEventListener('change', async (e)=>{
   }
 });
 
-// Auto-resume if user had mic on before navigating
 if(sessionStorage.getItem('scribble_mic') === '1'){
   micToggle.checked = true;
-  // will enable once ws opens
   const wait = setInterval(()=>{
     if(voice){ clearInterval(wait); voice.enable(); }
   }, 100);
 }
 
 connect();
+refreshRoundChips();
 </script>
 </body>
 </html>
