@@ -573,7 +573,13 @@ async def handle_message(room: Room, pid: str, msg: dict):
                 "signal": msg.get("signal"),
             })
         return
-
+    if mtype == "voice_activity":
+        await broadcast(room, {
+            "type": "voice_activity",
+            "player_id": pid,
+            "speaking": bool(msg.get("speaking")),
+        }, exclude={pid})
+        return
     if mtype == "request_state":
         await send_json(player.ws, room_state_payload(room))
         return
