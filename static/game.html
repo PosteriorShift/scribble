@@ -16,6 +16,9 @@
   .pill.word{color:var(--accent); letter-spacing:2px;}
   .pill.timer{color:var(--ok); min-width:60px; text-align:center;}
   .pill.timer.warn{color:var(--danger);}
+  .pill.mic{cursor:pointer; border:none; color:var(--text); transition:background .15s;}
+  .pill.mic.on{background:#7f1d1d; color:#fff;}
+  .pill.mic.connecting{background:#78350f;}
   main{flex:1; display:flex; flex-direction:column; min-height:0;}
   .canvas-wrap{flex:1; position:relative; background:#fff; margin:8px; border-radius:14px; overflow:hidden; min-height:0;}
   canvas{position:absolute; inset:0; width:100%; height:100%; touch-action:none; display:block;}
@@ -46,9 +49,10 @@
   .overlay button{margin-top:10px; padding:14px; width:100%; border-radius:12px; border:none; background:var(--accent); color:#0f172a; font-weight:800; font-size:16px; cursor:pointer;}
   .players-strip{display:flex; gap:6px; padding:0 12px 6px; overflow-x:auto; background:var(--panel); scrollbar-width:none;}
   .players-strip::-webkit-scrollbar{display:none;}
-  .pchip{flex:0 0 auto; background:#0f172a; border-radius:20px; padding:5px 11px; font-size:12px; display:flex; align-items:center; gap:6px;}
+  .pchip{flex:0 0 auto; background:#0f172a; border-radius:20px; padding:5px 11px; font-size:12px; display:flex; align-items:center; gap:6px; transition:box-shadow .15s;}
   .pchip .sc{color:var(--ok); font-weight:700;}
   .pchip.drawing{outline:2px solid var(--accent);}
+  .pchip.speaking{box-shadow:0 0 0 2px var(--ok);}
   @media (min-width: 900px){
     main{flex-direction:row;}
     .canvas-wrap{flex:2;}
@@ -63,6 +67,7 @@
     <div class="pill word" id="wordDisplay">—</div>
     <div class="pill">Round <b id="roundNum">1</b>/<b id="roundTotal">3</b></div>
     <div class="pill timer" id="timer">--</div>
+    <button class="pill mic" id="micBtn" title="Toggle microphone">🎙 Mic</button>
   </header>
 
   <div class="players-strip" id="playersStrip"></div>
@@ -93,6 +98,7 @@
     <div class="box" id="overlayBox"></div>
   </div>
 
+<script src="/static/voice.js"></script>
 <script>
 /* ---------------- Setup ---------------- */
 const $ = (id)=>document.getElementById(id);
@@ -125,6 +131,48 @@ let currentSize = 5;
 let eraserOn = false;
 let lastPoint = null;
 const COLORS = ['#111827','#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#78716c','#ffffff'];
+
+/* ---------------- Voice (WebRTC) ---------------- */
+let voice = null;
+const micBtn = $('micBtn');
+
+function initVoice(){
+  voice = new Voice({
+    ws,
+    myId: playerId,
+    send: (m)=>{ if(ws && ws.readyState === 1) ws.send(JSON.stringify(m)); },
+    onStatus: (s, info)=>{
+      const { connected=0, total=0 } = info || {};
+      const peers = Math.max(0, total - 1);
+      if(s === 'denied'){
+        micBtn.textContent = '🚫 Mic blocked';
+        micBtn.classList.remove('on','connecting');
+      } else if(s === 'on'){
+        micBtn.classList.add('on');
+        micBtn.classList.remove('connecting');
+        micBtn.textContent = peers > 0 ? `🔴 ${connected}/${peers}` : '🔴 Mic on';
+      } else {
+        micBtn.classList.remove('on','connecting');
+        micBtn.textContent = '🎙 Mic';
+      }
+    },
+    onActivity: ()=>{},
+  });
+}
+
+micBtn.addEventListener('click', async ()=>{
+  if(!voice) initVoice();
+  if(voice.enabled){
+    voice.disable();
+    sessionStorage.removeItem('scribble_mic');
+  } else {
+    micBtn.classList.add('connecting');
+    micBtn.textContent = '… connecting';
+    const ok = await voice.enable();
+    if(ok) sessionStorage.setItem('scribble_mic','1');
+    else micBtn.classList.remove('connecting');
+  }
+});
 
 /* ---------------- Canvas ---------------- */
 const canvas = $('board');
@@ -253,8 +301,12 @@ function renderPlayers(){
   const sorted = [...players].sort((a,b)=> b.score - a.score);
   sorted.forEach(p=>{
     const el = document.createElement('div');
-    el.className = 'pchip' + (p.id === drawerId ? ' drawing' : '') + (p.id === playerId ? ' me' : '');
-    el.innerHTML = `${escapeHtml(p.name)} <span class="sc">${p.score}</span>`;
+    el.className = 'pchip'
+      + (p.id === drawerId ? ' drawing' : '')
+      + (p.id === playerId ? ' me' : '')
+      + (p._speaking ? ' speaking' : '');
+    const speakIcon = p._speaking ? ' 🗣️' : '';
+    el.innerHTML = `${escapeHtml(p.name)}${speakIcon} <span class="sc">${p.score}</span>`;
     strip.appendChild(el);
   });
 }
@@ -283,6 +335,15 @@ function connect(){
   ws = new WebSocket(wsUrl);
   ws.addEventListener('open', ()=>{
     send({ type:'join', name });
+    if(voice) voice.ws = ws;
+    // Auto-resume mic if user had it on in lobby
+    if(sessionStorage.getItem('scribble_mic') === '1'){
+      if(!voice) initVoice();
+      voice.ws = ws;
+      micBtn.classList.add('connecting');
+      micBtn.textContent = '… connecting';
+      voice.enable().then(ok=>{ if(!ok) micBtn.classList.remove('connecting'); });
+    }
   });
   ws.addEventListener('message', ev=>{
     let msg; try{ msg = JSON.parse(ev.data); }catch(e){ return; }
@@ -316,6 +377,8 @@ function handle(msg){
       $('roundNum').textContent = msg.round + 1;
       $('roundTotal').textContent = msg.total_rounds;
       renderPlayers();
+      // keep voice mesh in sync with current players
+      if(voice && voice.enabled) voice.setPeers(msg.players);
       break;
     case 'round_start': {
       isDrawer = !!msg.is_drawer;
@@ -329,7 +392,6 @@ function handle(msg){
       $('chatInput').placeholder = isDrawer ? 'You are drawing!' : 'Type your guess…';
       $('chatInput').disabled = isDrawer;
 
-      // reset canvas
       ctx.fillStyle = '#ffffff';
       const rect = canvas.getBoundingClientRect();
       ctx.fillRect(0, 0, rect.width, rect.height);
@@ -347,11 +409,12 @@ function handle(msg){
     case 'draw':
       drawSegment(msg.x0, msg.y0, msg.x1, msg.y1, msg.color, msg.size, msg.erase);
       break;
-    case 'clear':
+    case 'clear': {
       ctx.fillStyle = '#ffffff';
       const r = canvas.getBoundingClientRect();
       ctx.fillRect(0, 0, r.width, r.height);
       break;
+    }
     case 'chat':
       addChat(msg.name, msg.text, 'chat', msg.player_id === playerId);
       break;
@@ -384,88 +447,24 @@ function handle(msg){
       if(btn) btn.addEventListener('click', ()=>{ send({type:'play_again'}); hideOverlay(); });
       break;
     }
-  }
-}
-
-/* ---------------- Voice (WebRTC) ---------------- */
-let localStream = null;
-const voicePeers = {};
-async function enableMic(){
-  try{
-    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
-    players.forEach(p=>{ if(p.id !== playerId && p.connected) ensureVoicePeer(p.id); });
-    addChat('', 'Microphone enabled.', 'system');
-  }catch(e){
-    addChat('', 'Microphone permission denied.', 'system');
-  }
-}
-function ensureVoicePeer(pid){
-  if(voicePeers[pid]) return voicePeers[pid];
-  const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-  voicePeers[pid] = pc;
-  if(localStream) localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
-  pc.onicecandidate = e=>{ if(e.candidate) send({type:'voice_signal', target:pid, signal:{ice:e.candidate}}); };
-  pc.ontrack = e=>{
-    let aud = document.getElementById('audio_'+pid);
-    if(!aud){ aud = document.createElement('audio'); aud.id = 'audio_'+pid; aud.autoplay = true; document.body.appendChild(aud); }
-    aud.srcObject = e.streams[0];
-  };
-  if(playerId < pid){
-    pc.onnegotiationneeded = async ()=>{
-      try{
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        send({type:'voice_signal', target:pid, signal:{sdp:pc.localDescription}});
-      }catch(e){}
-    };
-  }
-  return pc;
-}
-async function handleSignal(from, signal){
-  const pc = ensureVoicePeer(from);
-  try{
-    if(signal.sdp){
-      await pc.setRemoteDescription(signal.sdp);
-      if(signal.sdp.type === 'offer'){
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        send({type:'voice_signal', target:from, signal:{sdp:pc.localDescription}});
-      }
-    }else if(signal.ice){
-      await pc.addIceCandidate(signal.ice);
+    /* ---------- Voice signaling ---------- */
+    case 'voice_signal':
+      if(voice) voice.handleSignal(msg.from, msg.signal);
+      break;
+    case 'voice_activity': {
+      const p = players.find(x => x.id === msg.player_id);
+      if(p){ p._speaking = !!msg.speaking; renderPlayers(); }
+      break;
     }
-  }catch(e){ console.warn(e); }
-}
-
-// Hook voice into handle
-const _handle = handle;
-handle = function(msg){
-  if(msg.type === 'voice_signal'){ handleSignal(msg.from, msg.signal); return; }
-  if(msg.type === 'room_state'){
-    players = msg.players;
-    drawerId = msg.drawer_id;
-    renderPlayers();
-    if(localStream) players.forEach(p=>{ if(p.id !== playerId && p.connected) ensureVoicePeer(p.id); });
-    return;
   }
-  _handle(msg);
-};
-
-// Add a small mic toggle button into header
-const micBtn = document.createElement('button');
-micBtn.className = 'pill';
-micBtn.textContent = '🎙 Mic';
-micBtn.style.border = 'none';
-micBtn.style.cursor = 'pointer';
-micBtn.addEventListener('click', ()=>{
-  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream = null; micBtn.textContent = '🎙 Mic'; }
-  else { enableMic().then(()=> micBtn.textContent = '🔴 Mic on'); }
-});
-document.querySelector('header').appendChild(micBtn);
+}
 
 /* ---------------- Init ---------------- */
 resizeCanvas();
 connect();
+// Create voice instance immediately so micBtn works before ws opens
+initVoice();
+
 window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch(e){} });
 </script>
 </body>
