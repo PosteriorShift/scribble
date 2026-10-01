@@ -61,6 +61,7 @@
     <div class="status" id="status">Connecting…</div>
   </div>
 
+<script src="/static/voice.js"></script>
 <script>
 const $ = (id)=>document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -68,14 +69,11 @@ const roomCode = (params.get('room') || '').toUpperCase();
 const name = sessionStorage.getItem('scribble_name') || '';
 let playerId = localStorage.getItem('scribble_pid');
 
-if(!roomCode || !name){
-  alert('Missing name or room. Redirecting…');
-  location.href = '/';
-}
+if(!roomCode || !name){ alert('Missing name or room.'); location.href='/'; }
 
 $('roomCode').textContent = roomCode;
 $('copyCode').addEventListener('click', async ()=>{
-  try{ await navigator.clipboard.writeText(roomCode); $('copyCode').textContent = 'copied!';
+  try{ await navigator.clipboard.writeText(roomCode); $('copyCode').textContent='copied!';
     setTimeout(()=>$('copyCode').textContent='tap to copy',1500);
   }catch(e){}
 });
@@ -89,6 +87,25 @@ const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const wsUrl = `${proto}://${location.host}/ws/${roomCode}/${playerId}`;
 let ws;
 
+/* ---------- Voice setup ---------- */
+let voice = null;
+function initVoice(){
+  voice = new Voice({
+    ws,
+    myId: playerId,
+    send: (m)=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify(m)); },
+    onStatus: (s, info)=>{
+      const el = $('voiceStatus');
+      if(s === 'denied') el.textContent = 'Microphone permission denied.';
+      else if(s === 'on'){
+        const { connected=0, total=0 } = info || {};
+        el.textContent = `🎙 Live — connected to ${connected}/${Math.max(0,total-1)} peers`;
+      } else el.textContent = 'Voice off.';
+    },
+    onActivity: ()=>{},
+  });
+}
+
 function setStatus(s){ $('status').textContent = s; }
 
 function connect(){
@@ -96,6 +113,7 @@ function connect(){
   ws.addEventListener('open', ()=>{
     setStatus('Connected');
     ws.send(JSON.stringify({type:'join', name}));
+    if(!voice) initVoice();
   });
   ws.addEventListener('close', ()=>{
     setStatus('Disconnected — reconnecting…');
@@ -112,8 +130,9 @@ function renderPlayers(players, hostId){
   const ul = $('players'); ul.innerHTML = '';
   players.forEach(p=>{
     const li = document.createElement('li');
+    const speaking = p._speaking ? ' 🗣️' : '';
     li.innerHTML = `<span class="dot ${p.connected?'':'off'}"></span>
-      <span class="name">${escapeHtml(p.name)}</span>
+      <span class="name">${escapeHtml(p.name)}${speaking}</span>
       ${p.id === playerId ? '<span class="you">you</span>' : ''}
       ${p.is_host ? '<span class="host">HOST</span>' : ''}`;
     ul.appendChild(li);
@@ -127,10 +146,12 @@ function renderPlayers(players, hostId){
     startBtn.disabled = true;
     startBtn.textContent = 'Waiting for host…';
   }
+  if(voice) voice.setPeers(players);
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+let lastPlayers = [];
 function handle(msg){
   switch(msg.type){
     case 'welcome':
@@ -140,113 +161,60 @@ function handle(msg){
       setStatus('Reconnected');
       break;
     case 'room_state':
+      lastPlayers = msg.players;
       renderPlayers(msg.players, msg.host_id);
       break;
+    case 'voice_signal':
+      if(voice) voice.handleSignal(msg.from, msg.signal);
+      break;
+    case 'voice_activity': {
+      const p = lastPlayers.find(x=>x.id===msg.player_id);
+      if(p){ p._speaking = msg.speaking; renderPlayers(lastPlayers, currentHostId); }
+      break;
+    }
     case 'error':
       setStatus('⚠ ' + msg.message);
       break;
     case 'game_starting':
       setStatus('Starting game…');
       sessionStorage.setItem('scribble_player_id', playerId);
+      // Keep mic enabled across navigation by noting intent in sessionStorage
+      if(voice && voice.enabled) sessionStorage.setItem('scribble_mic', '1');
       setTimeout(()=>{ location.href = '/game?room=' + roomCode; }, 400);
       break;
   }
 }
-
-$('startBtn').addEventListener('click', ()=>{
-  if(ws && ws.readyState === 1){
-    ws.send(JSON.stringify({type:'start_game'}));
-  }
-});
-
-// ---- Voice (WebRTC) ----
-let localStream = null;
-const peers = {};
-const pendingIce = {};
-
-async function enableMic(){
-  try{
-    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
-    $('voiceStatus').textContent = 'Mic enabled. Establishing peer connections…';
-    // We'll connect lazily to players present in room_state.
-    // (Full mesh; for demo we just set up on demand.)
-    for(const pid of Object.keys(peers)) ensurePeer(pid);
-  }catch(e){
-    $('voiceStatus').textContent = 'Microphone permission denied.';
-    $('micToggle').checked = false;
-  }
-}
-function disableMic(){
-  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream = null; }
-  for(const pid in peers){ try{ peers[pid].close(); }catch(e){} }
-  for(const pid in peers) delete peers[pid];
-  $('voiceStatus').textContent = 'Mic off.';
-}
-function ensurePeer(pid){
-  if(peers[pid]) return peers[pid];
-  const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-  peers[pid] = pc;
-  if(localStream) localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
-  pc.onicecandidate = (e)=>{
-    if(e.candidate){
-      ws.send(JSON.stringify({type:'voice_signal', target:pid, signal:{ice:e.candidate}}));
-    }
-  };
-  pc.ontrack = (e)=>{
-    let aud = document.getElementById('audio_' + pid);
-    if(!aud){ aud = document.createElement('audio'); aud.id = 'audio_'+pid; aud.autoplay = true; document.body.appendChild(aud); }
-    aud.srcObject = e.streams[0];
-  };
-  // Deterministic initiator: lower id initiates
-  if(playerId < pid){
-    pc.onnegotiationneeded = async ()=>{
-      try{
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        ws.send(JSON.stringify({type:'voice_signal', target:pid, signal:{sdp:pc.localDescription}}));
-      }catch(e){}
-    };
-  }
-  return pc;
-}
-async function handleSignal(from, signal){
-  const pc = ensurePeer(from);
-  try{
-    if(signal.sdp){
-      await pc.setRemoteDescription(signal.sdp);
-      if(signal.sdp.type === 'offer'){
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type:'voice_signal', target:from, signal:{sdp:pc.localDescription}}));
-      }
-    }else if(signal.ice){
-      await pc.addIceCandidate(signal.ice);
-    }
-  }catch(e){ console.warn('signal err', e); }
-}
-
-// patch handle() to also route voice signals and start peers
-const _handle = handle;
+let currentHostId = null;
+// capture host id from room_state
+const _h = handle;
 handle = function(msg){
-  if(msg.type === 'voice_signal'){
-    handleSignal(msg.from, msg.signal);
-    return;
-  }
-  if(msg.type === 'room_state'){
-    renderPlayers(msg.players, msg.host_id);
-    if(localStream){
-      msg.players.forEach(p=>{
-        if(p.id !== playerId && p.connected) ensurePeer(p.id);
-      });
-    }
-    return;
-  }
-  _handle(msg);
+  if(msg.type === 'room_state') currentHostId = msg.host_id;
+  _h(msg);
 };
 
-$('micToggle').addEventListener('change', (e)=>{
-  if(e.target.checked) enableMic(); else disableMic();
+$('startBtn').addEventListener('click', ()=>{
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify({type:'start_game'}));
 });
+
+/* ---------- Mic toggle ---------- */
+const micToggle = $('micToggle');
+micToggle.addEventListener('change', async (e)=>{
+  if(e.target.checked){
+    const ok = await voice.enable();
+    if(!ok) e.target.checked = false;
+  } else {
+    voice.disable();
+  }
+});
+
+// Auto-resume if user had mic on before navigating
+if(sessionStorage.getItem('scribble_mic') === '1'){
+  micToggle.checked = true;
+  // will enable once ws opens
+  const wait = setInterval(()=>{
+    if(voice){ clearInterval(wait); voice.enable(); }
+  }, 100);
+}
 
 connect();
 </script>
