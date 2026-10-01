@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<title>Play — Scribble</title>
+<style>
+  :root{ --bg:#0f172a; --panel:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --danger:#ef4444;}
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;height:100dvh; overflow:hidden;}
+  body{background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column; height:100dvh;}
+  header{display:flex; justify-content:space-between; align-items:center; padding:8px 12px; background:var(--panel); gap:8px; flex-wrap:wrap;}
+  .pill{background:#0f172a; border-radius:20px; padding:6px 12px; font-size:13px; font-weight:600;}
+  .pill.word{color:var(--accent); letter-spacing:2px;}
+  .pill.timer{color:var(--ok); min-width:60px; text-align:center;}
+  .pill.timer.warn{color:var(--danger);}
+  main{flex:1; display:flex; flex-direction:column; min-height:0;}
+  .canvas-wrap{flex:1; position:relative; background:#fff; margin:8px; border-radius:14px; overflow:hidden; min-height:0;}
+  canvas{position:absolute; inset:0; width:100%; height:100%; touch-action:none; display:block;}
+  .toolbar{display:flex; align-items:center; gap:6px; padding:8px 10px; background:var(--panel); overflow-x:auto; scrollbar-width:none;}
+  .toolbar::-webkit-scrollbar{display:none;}
+  .swatch{width:26px; height:26px; border-radius:50%; border:2px solid transparent; flex:0 0 auto; cursor:pointer;}
+  .swatch.active{border-color:#fff;}
+  .tool{background:#0f172a; color:var(--text); border:none; padding:8px 12px; border-radius:10px; font-size:13px; cursor:pointer; flex:0 0 auto;}
+  .tool.active{background:var(--accent); color:#0f172a;}
+  .size{padding:0 6px;}
+  .bottom{background:var(--panel); display:flex; flex-direction:column; max-height:38dvh;}
+  .chatlog{flex:1; overflow-y:auto; padding:8px 12px; font-size:14px; min-height:60px;}
+  .chatlog .msg{padding:3px 0; line-height:1.3; word-wrap:break-word;}
+  .chatlog .msg .who{font-weight:700; color:var(--accent);}
+  .chatlog .msg.system{color:var(--muted); font-style:italic; font-size:12.5px;}
+  .chatlog .msg.correct{color:var(--ok); font-weight:700;}
+  .chatlog .msg.me .who{color:#fbbf24;}
+  .chatrow{display:flex; gap:8px; padding:8px; border-top:1px solid #334155;}
+  .chatrow input{flex:1; padding:12px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:var(--text); font-size:15px; outline:none; min-width:0;}
+  .chatrow button{padding:12px 16px; border-radius:10px; border:none; background:var(--accent); color:#0f172a; font-weight:700; cursor:pointer;}
+  .overlay{position:fixed; inset:0; background:rgba(15,23,42,.92); display:none; align-items:center; justify-content:center; z-index:50; padding:16px;}
+  .overlay.show{display:flex;}
+  .overlay .box{background:var(--panel); border-radius:18px; padding:24px; max-width:460px; width:100%; text-align:center;}
+  .overlay h2{margin:0 0 8px; font-size:26px;}
+  .overlay .word{font-size:22px; color:var(--accent); letter-spacing:3px; margin:10px 0; font-weight:800;}
+  .overlay ol{text-align:left; margin:14px 0; padding-left:20px;}
+  .overlay ol li{padding:4px 0;}
+  .overlay button{margin-top:10px; padding:14px; width:100%; border-radius:12px; border:none; background:var(--accent); color:#0f172a; font-weight:800; font-size:16px; cursor:pointer;}
+  .players-strip{display:flex; gap:6px; padding:0 12px 6px; overflow-x:auto; background:var(--panel); scrollbar-width:none;}
+  .players-strip::-webkit-scrollbar{display:none;}
+  .pchip{flex:0 0 auto; background:#0f172a; border-radius:20px; padding:5px 11px; font-size:12px; display:flex; align-items:center; gap:6px;}
+  .pchip .sc{color:var(--ok); font-weight:700;}
+  .pchip.drawing{outline:2px solid var(--accent);}
+  @media (min-width: 900px){
+    main{flex-direction:row;}
+    .canvas-wrap{flex:2;}
+    .side{flex:1; max-width:360px; display:flex; flex-direction:column;}
+    .bottom{max-height:none; flex:1;}
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="pill">Room <b id="roomCode">----</b></div>
+    <div class="pill word" id="wordDisplay">—</div>
+    <div class="pill">Round <b id="roundNum">1</b>/<b id="roundTotal">3</b></div>
+    <div class="pill timer" id="timer">--</div>
+  </header>
+
+  <div class="players-strip" id="playersStrip"></div>
+
+  <main>
+    <div class="canvas-wrap">
+      <canvas id="board"></canvas>
+    </div>
+
+    <div class="side">
+      <div class="toolbar" id="toolbar">
+        <!-- color swatches injected -->
+        <button class="tool" id="eraserBtn">Eraser</button>
+        <button class="tool" id="clearBtn">Clear</button>
+        <input type="range" min="2" max="24" value="5" class="size" id="sizeRange" />
+      </div>
+      <div class="bottom">
+        <div class="chatlog" id="chatlog"></div>
+        <div class="chatrow">
+          <input id="chatInput" placeholder="Type your guess…" maxlength="120" autocomplete="off" autocorrect="off" autocapitalize="off" />
+          <button id="sendBtn">Send</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="overlay" id="overlay">
+    <div class="box" id="overlayBox"></div>
+  </div>
+
+<script>
+/* ---------------- Setup ---------------- */
+const $ = (id)=>document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const roomCode = (params.get('room') || '').toUpperCase();
+const name = sessionStorage.getItem('scribble_name') || 'Player';
+const playerId = localStorage.getItem('scribble_pid') || ('p_' + Math.random().toString(36).slice(2,10));
+
+if(!roomCode || !name){
+  location.href = '/';
+}
+
+$('roomCode').textContent = roomCode;
+
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const wsUrl = `${proto}://${location.host}/ws/${roomCode}/${playerId}`;
+let ws;
+let reconnectTimer = null;
+
+/* ---------------- State ---------------- */
+let isDrawer = false;
+let drawerId = null;
+let myScore = 0;
+let players = [];
+let currentWordMask = '';
+let roundEndsAt = 0;
+let timerInterval = null;
+let currentColor = '#111827';
+let currentSize = 5;
+let eraserOn = false;
+let lastPoint = null;
+const COLORS = ['#111827','#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#78716c','#ffffff'];
+
+/* ---------------- Canvas ---------------- */
+const canvas = $('board');
+const ctx = canvas.getContext('2d');
+let dpr = window.devicePixelRatio || 1;
+
+function resizeCanvas(){
+  const rect = canvas.parentElement.getBoundingClientRect();
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, rect.width, rect.height);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+}
+window.addEventListener('resize', resizeCanvas);
+
+function canvasPointFromEvent(ev){
+  const rect = canvas.getBoundingClientRect();
+  let cx, cy;
+  if(ev.touches && ev.touches[0]){
+    cx = ev.touches[0].clientX; cy = ev.touches[0].clientY;
+  }else if(ev.changedTouches && ev.changedTouches[0]){
+    cx = ev.changedTouches[0].clientX; cy = ev.changedTouches[0].clientY;
+  }else{
+    cx = ev.clientX; cy = ev.clientY;
+  }
+  return { x: cx - rect.left, y: cy - rect.top };
+}
+
+function drawSegment(x0,y0,x1,y1,color,size,erase){
+  ctx.strokeStyle = erase ? '#ffffff' : color;
+  ctx.lineWidth = size;
+  ctx.beginPath();
+  ctx.moveTo(x0,y0);
+  ctx.lineTo(x1,y1);
+  ctx.stroke();
+}
+
+function strokeStart(ev){
+  if(!isDrawer){ return; }
+  ev.preventDefault();
+  lastPoint = canvasPointFromEvent(ev);
+}
+function strokeMove(ev){
+  if(!isDrawer || !lastPoint) return;
+  ev.preventDefault();
+  const p = canvasPointFromEvent(ev);
+  const erase = eraserOn;
+  const color = currentColor;
+  const size = currentSize;
+  drawSegment(lastPoint.x, lastPoint.y, p.x, p.y, color, size, erase);
+  send({ type:'draw', x0:lastPoint.x, y0:lastPoint.y, x1:p.x, y1:p.y, color, size, erase });
+  lastPoint = p;
+}
+function strokeEnd(ev){
+  if(!isDrawer) return;
+  if(ev) ev.preventDefault();
+  lastPoint = null;
+}
+
+canvas.addEventListener('mousedown', strokeStart);
+canvas.addEventListener('mousemove', strokeMove);
+window.addEventListener('mouseup', strokeEnd);
+canvas.addEventListener('touchstart', strokeStart, {passive:false});
+canvas.addEventListener('touchmove', strokeMove, {passive:false});
+canvas.addEventListener('touchend', strokeEnd, {passive:false});
+canvas.addEventListener('touchcancel', strokeEnd, {passive:false});
+
+/* ---------------- Toolbar ---------------- */
+const toolbar = $('toolbar');
+COLORS.forEach(c=>{
+  const el = document.createElement('div');
+  el.className = 'swatch' + (c === currentColor ? ' active' : '');
+  el.style.background = c;
+  el.dataset.color = c;
+  el.addEventListener('click', ()=>{
+    currentColor = c; eraserOn = false;
+    document.querySelectorAll('.swatch').forEach(s=>s.classList.toggle('active', s.dataset.color === c));
+    $('eraserBtn').classList.remove('active');
+  });
+  toolbar.insertBefore(el, toolbar.firstChild);
+});
+
+$('eraserBtn').addEventListener('click', ()=>{
+  eraserOn = !eraserOn;
+  $('eraserBtn').classList.toggle('active', eraserOn);
+});
+$('clearBtn').addEventListener('click', ()=>{
+  if(!isDrawer) return;
+  send({ type:'clear' });
+});
+$('sizeRange').addEventListener('input', (e)=>{ currentSize = parseInt(e.target.value,10); });
+
+/* ---------------- Chat ---------------- */
+const chatlog = $('chatlog');
+function addChat(who, text, kind='chat', mine=false){
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind + (mine ? ' me' : '');
+  if(kind === 'system') div.textContent = text;
+  else if(kind === 'correct') div.textContent = text;
+  else div.innerHTML = `<span class="who">${escapeHtml(who)}:</span> ${escapeHtml(text)}`;
+  chatlog.appendChild(div);
+  chatlog.scrollTop = chatlog.scrollHeight;
+  while(chatlog.children.length > 200) chatlog.removeChild(chatlog.firstChild);
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function send(msg){ if(ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+
+$('sendBtn').addEventListener('click', sendChat);
+$('chatInput').addEventListener('keydown', e=>{ if(e.key === 'Enter') sendChat(); });
+function sendChat(){
+  const text = $('chatInput').value.trim();
+  if(!text) return;
+  send({ type:'chat', text });
+  $('chatInput').value = '';
+}
+
+/* ---------------- Rendering: players, timer ---------------- */
+function renderPlayers(){
+  const strip = $('playersStrip');
+  strip.innerHTML = '';
+  const sorted = [...players].sort((a,b)=> b.score - a.score);
+  sorted.forEach(p=>{
+    const el = document.createElement('div');
+    el.className = 'pchip' + (p.id === drawerId ? ' drawing' : '') + (p.id === playerId ? ' me' : '');
+    el.innerHTML = `${escapeHtml(p.name)} <span class="sc">${p.score}</span>`;
+    strip.appendChild(el);
+  });
+}
+
+function startTimer(endTime){
+  roundEndsAt = endTime;
+  if(timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(()=>{
+    const remain = Math.max(0, Math.ceil(roundEndsAt - Date.now()/1000));
+    const t = $('timer');
+    t.textContent = remain + 's';
+    t.classList.toggle('warn', remain <= 10);
+    if(remain <= 0) clearInterval(timerInterval);
+  }, 250);
+}
+
+/* ---------------- Overlay ---------------- */
+function showOverlay(html){
+  $('overlayBox').innerHTML = html;
+  $('overlay').classList.add('show');
+}
+function hideOverlay(){ $('overlay').classList.remove('show'); }
+
+/* ---------------- WebSocket ---------------- */
+function connect(){
+  ws = new WebSocket(wsUrl);
+  ws.addEventListener('open', ()=>{
+    send({ type:'join', name });
+  });
+  ws.addEventListener('message', ev=>{
+    let msg; try{ msg = JSON.parse(ev.data); }catch(e){ return; }
+    handle(msg);
+  });
+  ws.addEventListener('close', ()=>{
+    addChat('', 'Disconnected. Reconnecting…', 'system');
+    if(reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 1500);
+  });
+}
+
+function handle(msg){
+  switch(msg.type){
+    case 'welcome':
+      addChat('', `Connected to room ${msg.room}`, 'system');
+      break;
+    case 'welcome_back':
+      addChat('', 'Reconnected', 'system');
+      send({ type:'request_state' });
+      break;
+    case 'error':
+      addChat('', '⚠ ' + msg.message, 'system');
+      break;
+    case 'system':
+      addChat('', msg.message, 'system');
+      break;
+    case 'room_state':
+      players = msg.players;
+      drawerId = msg.drawer_id;
+      $('roundNum').textContent = msg.round + 1;
+      $('roundTotal').textContent = msg.total_rounds;
+      renderPlayers();
+      break;
+    case 'round_start': {
+      isDrawer = !!msg.is_drawer;
+      drawerId = msg.drawer_id;
+      roundEndsAt = msg.end_time;
+      $('roundNum').textContent = (msg.round + 1);
+      $('roundTotal').textContent = msg.total_rounds;
+      $('clearBtn').style.display = isDrawer ? '' : 'none';
+      $('eraserBtn').style.display = isDrawer ? '' : 'none';
+      $('sizeRange').style.display = isDrawer ? '' : 'none';
+      $('chatInput').placeholder = isDrawer ? 'You are drawing!' : 'Type your guess…';
+      $('chatInput').disabled = isDrawer;
+
+      // reset canvas
+      ctx.fillStyle = '#ffffff';
+      const rect = canvas.getBoundingClientRect();
+      ctx.fillRect(0, 0, rect.width, rect.height);
+
+      if(isDrawer){
+        $('wordDisplay').textContent = msg.word.toUpperCase();
+        addChat('', `You are drawing: ${msg.word}`, 'system');
+      }else{
+        $('wordDisplay').textContent = msg.word;
+      }
+      startTimer(msg.end_time);
+      hideOverlay();
+      break;
+    }
+    case 'draw':
+      drawSegment(msg.x0, msg.y0, msg.x1, msg.y1, msg.color, msg.size, msg.erase);
+      break;
+    case 'clear':
+      ctx.fillStyle = '#ffffff';
+      const r = canvas.getBoundingClientRect();
+      ctx.fillRect(0, 0, r.width, r.height);
+      break;
+    case 'chat':
+      addChat(msg.name, msg.text, 'chat', msg.player_id === playerId);
+      break;
+    case 'correct_guess':
+      players = msg.players;
+      renderPlayers();
+      addChat('', `${msg.name} guessed the word! (+${msg.points})`, 'correct');
+      if(msg.player_id !== playerId && isDrawer){
+        $('wordDisplay').textContent = msg.word.toUpperCase();
+      }
+      break;
+    case 'round_end': {
+      if(timerInterval) clearInterval(timerInterval);
+      addChat('', `Round over. The word was "${msg.word}".`, 'system');
+      $('wordDisplay').textContent = msg.word.toUpperCase();
+      break;
+    }
+    case 'game_over': {
+      if(timerInterval) clearInterval(timerInterval);
+      players = msg.players;
+      const sorted = [...players].sort((a,b)=> b.score - a.score);
+      const rows = sorted.map((p,i)=>`<li>${i+1}. <b>${escapeHtml(p.name)}</b> — ${p.score}</li>`).join('');
+      const isHost = players.some(p=>p.id === playerId && p.is_host);
+      showOverlay(`
+        <h2>🏆 Game Over</h2>
+        <ol>${rows}</ol>
+        ${isHost ? `<button id="playAgainBtn">Play Again</button>` : '<div style="color:var(--muted); margin-top:10px;">Waiting for host…</div>'}
+      `);
+      const btn = $('playAgainBtn');
+      if(btn) btn.addEventListener('click', ()=>{ send({type:'play_again'}); hideOverlay(); });
+      break;
+    }
+  }
+}
+
+/* ---------------- Voice (WebRTC) ---------------- */
+let localStream = null;
+const voicePeers = {};
+async function enableMic(){
+  try{
+    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    players.forEach(p=>{ if(p.id !== playerId && p.connected) ensureVoicePeer(p.id); });
+    addChat('', 'Microphone enabled.', 'system');
+  }catch(e){
+    addChat('', 'Microphone permission denied.', 'system');
+  }
+}
+function ensureVoicePeer(pid){
+  if(voicePeers[pid]) return voicePeers[pid];
+  const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  voicePeers[pid] = pc;
+  if(localStream) localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
+  pc.onicecandidate = e=>{ if(e.candidate) send({type:'voice_signal', target:pid, signal:{ice:e.candidate}}); };
+  pc.ontrack = e=>{
+    let aud = document.getElementById('audio_'+pid);
+    if(!aud){ aud = document.createElement('audio'); aud.id = 'audio_'+pid; aud.autoplay = true; document.body.appendChild(aud); }
+    aud.srcObject = e.streams[0];
+  };
+  if(playerId < pid){
+    pc.onnegotiationneeded = async ()=>{
+      try{
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({type:'voice_signal', target:pid, signal:{sdp:pc.localDescription}});
+      }catch(e){}
+    };
+  }
+  return pc;
+}
+async function handleSignal(from, signal){
+  const pc = ensureVoicePeer(from);
+  try{
+    if(signal.sdp){
+      await pc.setRemoteDescription(signal.sdp);
+      if(signal.sdp.type === 'offer'){
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({type:'voice_signal', target:from, signal:{sdp:pc.localDescription}});
+      }
+    }else if(signal.ice){
+      await pc.addIceCandidate(signal.ice);
+    }
+  }catch(e){ console.warn(e); }
+}
+
+// Hook voice into handle
+const _handle = handle;
+handle = function(msg){
+  if(msg.type === 'voice_signal'){ handleSignal(msg.from, msg.signal); return; }
+  if(msg.type === 'room_state'){
+    players = msg.players;
+    drawerId = msg.drawer_id;
+    renderPlayers();
+    if(localStream) players.forEach(p=>{ if(p.id !== playerId && p.connected) ensureVoicePeer(p.id); });
+    return;
+  }
+  _handle(msg);
+};
+
+// Add a small mic toggle button into header
+const micBtn = document.createElement('button');
+micBtn.className = 'pill';
+micBtn.textContent = '🎙 Mic';
+micBtn.style.border = 'none';
+micBtn.style.cursor = 'pointer';
+micBtn.addEventListener('click', ()=>{
+  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream = null; micBtn.textContent = '🎙 Mic'; }
+  else { enableMic().then(()=> micBtn.textContent = '🔴 Mic on'); }
+});
+document.querySelector('header').appendChild(micBtn);
+
+/* ---------------- Init ---------------- */
+resizeCanvas();
+connect();
+window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch(e){} });
+</script>
+</body>
+</html>
