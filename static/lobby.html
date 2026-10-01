@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Lobby — Scribble</title>
+<style>
+  :root{ --bg:#0f172a; --panel:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --danger:#ef4444;}
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;min-height:100dvh;}
+  body{background:radial-gradient(circle at top,#1e293b,#0f172a 60%); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:16px;}
+  .wrap{max-width:640px; margin:0 auto;}
+  header{display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;}
+  h1{font-size:22px; margin:0;}
+  .code{font-size:26px; font-weight:800; letter-spacing:4px; color:var(--accent);}
+  .copy{font-size:12px; color:var(--muted); cursor:pointer; text-decoration:underline;}
+  .panel{background:var(--panel); border-radius:16px; padding:16px; margin-bottom:14px; box-shadow:0 10px 30px rgba(0,0,0,.4);}
+  .panel h2{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin:0 0 10px;}
+  ul{list-style:none; margin:0; padding:0;}
+  li{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #334155;}
+  li:last-child{border-bottom:none;}
+  .dot{width:10px;height:10px;border-radius:50%; background:var(--ok);}
+  .dot.off{background:var(--danger);}
+  .name{flex:1; font-weight:600;}
+  .host{font-size:11px; background:var(--accent); color:#0f172a; padding:2px 8px; border-radius:20px; font-weight:700;}
+  .you{color:var(--muted); font-size:12px;}
+  button{width:100%; padding:15px; border-radius:12px; border:none; font-size:16px; font-weight:700; cursor:pointer; background:var(--accent); color:#0f172a; margin-top:6px;}
+  button:disabled{opacity:.5; cursor:not-allowed;}
+  button.secondary{background:transparent; border:1px solid var(--accent); color:var(--accent);}
+  .status{font-size:13px; color:var(--muted); text-align:center; margin-top:8px;}
+  .mic-row{display:flex; align-items:center; gap:10px; margin-top:8px; font-size:13px; color:var(--muted);}
+  .mic-row input{width:auto;}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Scrib<span style="color:var(--accent)">ble</span> Lobby</h1>
+      <div>
+        <div class="code" id="roomCode">----</div>
+        <div class="copy" id="copyCode">tap to copy</div>
+      </div>
+    </header>
+
+    <div class="panel">
+      <h2>Players (<span id="count">0</span>/10)</h2>
+      <ul id="players"></ul>
+    </div>
+
+    <div class="panel">
+      <h2>Voice chat</h2>
+      <div class="mic-row">
+        <input type="checkbox" id="micToggle" />
+        <label for="micToggle" style="margin:0; color:var(--text);">Enable microphone</label>
+      </div>
+      <div class="status" id="voiceStatus">Voice is optional.</div>
+    </div>
+
+    <button id="startBtn" disabled>Waiting for host…</button>
+    <div class="status" id="status">Connecting…</div>
+  </div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const roomCode = (params.get('room') || '').toUpperCase();
+const name = sessionStorage.getItem('scribble_name') || '';
+let playerId = localStorage.getItem('scribble_pid');
+
+if(!roomCode || !name){
+  alert('Missing name or room. Redirecting…');
+  location.href = '/';
+}
+
+$('roomCode').textContent = roomCode;
+$('copyCode').addEventListener('click', async ()=>{
+  try{ await navigator.clipboard.writeText(roomCode); $('copyCode').textContent = 'copied!';
+    setTimeout(()=>$('copyCode').textContent='tap to copy',1500);
+  }catch(e){}
+});
+
+if(!playerId){
+  playerId = 'p_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36);
+  localStorage.setItem('scribble_pid', playerId);
+}
+
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const wsUrl = `${proto}://${location.host}/ws/${roomCode}/${playerId}`;
+let ws;
+
+function setStatus(s){ $('status').textContent = s; }
+
+function connect(){
+  ws = new WebSocket(wsUrl);
+  ws.addEventListener('open', ()=>{
+    setStatus('Connected');
+    ws.send(JSON.stringify({type:'join', name}));
+  });
+  ws.addEventListener('close', ()=>{
+    setStatus('Disconnected — reconnecting…');
+    setTimeout(connect, 1500);
+  });
+  ws.addEventListener('message', (ev)=>{
+    let msg; try{ msg = JSON.parse(ev.data); }catch(e){ return; }
+    handle(msg);
+  });
+}
+
+function renderPlayers(players, hostId){
+  $('count').textContent = players.length;
+  const ul = $('players'); ul.innerHTML = '';
+  players.forEach(p=>{
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="dot ${p.connected?'':'off'}"></span>
+      <span class="name">${escapeHtml(p.name)}</span>
+      ${p.id === playerId ? '<span class="you">you</span>' : ''}
+      ${p.is_host ? '<span class="host">HOST</span>' : ''}`;
+    ul.appendChild(li);
+  });
+  const startBtn = $('startBtn');
+  const isHost = hostId === playerId;
+  if(isHost){
+    startBtn.disabled = players.length < 2;
+    startBtn.textContent = players.length < 2 ? 'Need 2+ players' : 'Start Game';
+  }else{
+    startBtn.disabled = true;
+    startBtn.textContent = 'Waiting for host…';
+  }
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function handle(msg){
+  switch(msg.type){
+    case 'welcome':
+      setStatus('In room ' + msg.room);
+      break;
+    case 'welcome_back':
+      setStatus('Reconnected');
+      break;
+    case 'room_state':
+      renderPlayers(msg.players, msg.host_id);
+      break;
+    case 'error':
+      setStatus('⚠ ' + msg.message);
+      break;
+    case 'game_starting':
+      setStatus('Starting game…');
+      sessionStorage.setItem('scribble_player_id', playerId);
+      setTimeout(()=>{ location.href = '/game?room=' + roomCode; }, 400);
+      break;
+  }
+}
+
+$('startBtn').addEventListener('click', ()=>{
+  if(ws && ws.readyState === 1){
+    ws.send(JSON.stringify({type:'start_game'}));
+  }
+});
+
+// ---- Voice (WebRTC) ----
+let localStream = null;
+const peers = {};
+const pendingIce = {};
+
+async function enableMic(){
+  try{
+    localStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    $('voiceStatus').textContent = 'Mic enabled. Establishing peer connections…';
+    // We'll connect lazily to players present in room_state.
+    // (Full mesh; for demo we just set up on demand.)
+    for(const pid of Object.keys(peers)) ensurePeer(pid);
+  }catch(e){
+    $('voiceStatus').textContent = 'Microphone permission denied.';
+    $('micToggle').checked = false;
+  }
+}
+function disableMic(){
+  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream = null; }
+  for(const pid in peers){ try{ peers[pid].close(); }catch(e){} }
+  for(const pid in peers) delete peers[pid];
+  $('voiceStatus').textContent = 'Mic off.';
+}
+function ensurePeer(pid){
+  if(peers[pid]) return peers[pid];
+  const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  peers[pid] = pc;
+  if(localStream) localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
+  pc.onicecandidate = (e)=>{
+    if(e.candidate){
+      ws.send(JSON.stringify({type:'voice_signal', target:pid, signal:{ice:e.candidate}}));
+    }
+  };
+  pc.ontrack = (e)=>{
+    let aud = document.getElementById('audio_' + pid);
+    if(!aud){ aud = document.createElement('audio'); aud.id = 'audio_'+pid; aud.autoplay = true; document.body.appendChild(aud); }
+    aud.srcObject = e.streams[0];
+  };
+  // Deterministic initiator: lower id initiates
+  if(playerId < pid){
+    pc.onnegotiationneeded = async ()=>{
+      try{
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({type:'voice_signal', target:pid, signal:{sdp:pc.localDescription}}));
+      }catch(e){}
+    };
+  }
+  return pc;
+}
+async function handleSignal(from, signal){
+  const pc = ensurePeer(from);
+  try{
+    if(signal.sdp){
+      await pc.setRemoteDescription(signal.sdp);
+      if(signal.sdp.type === 'offer'){
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({type:'voice_signal', target:from, signal:{sdp:pc.localDescription}}));
+      }
+    }else if(signal.ice){
+      await pc.addIceCandidate(signal.ice);
+    }
+  }catch(e){ console.warn('signal err', e); }
+}
+
+// patch handle() to also route voice signals and start peers
+const _handle = handle;
+handle = function(msg){
+  if(msg.type === 'voice_signal'){
+    handleSignal(msg.from, msg.signal);
+    return;
+  }
+  if(msg.type === 'room_state'){
+    renderPlayers(msg.players, msg.host_id);
+    if(localStream){
+      msg.players.forEach(p=>{
+        if(p.id !== playerId && p.connected) ensurePeer(p.id);
+      });
+    }
+    return;
+  }
+  _handle(msg);
+};
+
+$('micToggle').addEventListener('change', (e)=>{
+  if(e.target.checked) enableMic(); else disableMic();
+});
+
+connect();
+</script>
+</body>
+</html>
