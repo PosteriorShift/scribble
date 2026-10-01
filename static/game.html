@@ -219,6 +219,10 @@ function strokeStart(ev){
   ev.preventDefault();
   lastPoint = canvasPointFromEvent(ev);
 }
+let lastSendTime = 0;
+const SEND_INTERVAL_MS = 16; // ~60Hz cap
+let pendingStroke = null;
+
 function strokeMove(ev){
   if(!isDrawer || !lastPoint) return;
   ev.preventDefault();
@@ -226,10 +230,29 @@ function strokeMove(ev){
   const erase = eraserOn;
   const color = currentColor;
   const size = currentSize;
+  // Draw locally immediately (never blocked by network)
   drawSegment(lastPoint.x, lastPoint.y, p.x, p.y, color, size, erase);
-  send({ type:'draw', x0:lastPoint.x, y0:lastPoint.y, x1:p.x, y1:p.y, color, size, erase });
+
+  // Coalesce network sends to one per frame
+  pendingStroke = { type:'draw',
+    x0:lastPoint.x, y0:lastPoint.y, x1:p.x, y1:p.y,
+    color, size, erase };
   lastPoint = p;
 }
+
+// Flush on rAF — batches multiple pointermove events per frame
+function flushStroke(){
+  if(pendingStroke && ws && ws.readyState === 1){
+    const now = performance.now();
+    if(now - lastSendTime >= SEND_INTERVAL_MS){
+      ws.send(JSON.stringify(pendingStroke));
+      pendingStroke = null;
+      lastSendTime = now;
+    }
+  }
+  requestAnimationFrame(flushStroke);
+}
+requestAnimationFrame(flushStroke);
 function strokeEnd(ev){
   if(!isDrawer) return;
   if(ev) ev.preventDefault();
@@ -406,8 +429,13 @@ function handle(msg){
       hideOverlay();
       break;
     }
-    case 'draw':
-      drawSegment(msg.x0, msg.y0, msg.x1, msg.y1, msg.color, msg.size, msg.erase);
+        case 'draw':
+      drawSegment(
+        msg.x0, msg.y0, msg.x1, msg.y1,
+        msg.c ?? msg.color,     // server now sends short key 'c'
+        msg.s ?? msg.size,      //                    's'
+        msg.e ?? msg.erase      //                    'e'
+      );
       break;
     case 'clear': {
       ctx.fillStyle = '#ffffff';
