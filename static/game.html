@@ -28,6 +28,7 @@
   .swatch.active{border-color:#fff;}
   .tool{background:#0f172a; color:var(--text); border:none; padding:8px 12px; border-radius:10px; font-size:13px; cursor:pointer; flex:0 0 auto;}
   .tool.active{background:var(--accent); color:#0f172a;}
+  .tool.warn{background:#7f1d1d; color:#fff;}
   .size{padding:0 6px;}
   .bottom{background:var(--panel); display:flex; flex-direction:column; max-height:38dvh;}
   .chatlog{flex:1; overflow-y:auto; padding:8px 12px; font-size:14px; min-height:60px;}
@@ -35,6 +36,7 @@
   .chatlog .msg .who{font-weight:700; color:var(--accent);}
   .chatlog .msg.system{color:var(--muted); font-style:italic; font-size:12.5px;}
   .chatlog .msg.correct{color:var(--ok); font-weight:700;}
+  .chatlog .msg.close{color:#fbbf24; font-style:italic;}
   .chatlog .msg.me .who{color:#fbbf24;}
   .chatrow{display:flex; gap:8px; padding:8px; border-top:1px solid #334155;}
   .chatrow input{flex:1; padding:12px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:var(--text); font-size:15px; outline:none; min-width:0;}
@@ -43,10 +45,19 @@
   .overlay.show{display:flex;}
   .overlay .box{background:var(--panel); border-radius:18px; padding:24px; max-width:460px; width:100%; text-align:center;}
   .overlay h2{margin:0 0 8px; font-size:26px;}
-  .overlay .word{font-size:22px; color:var(--accent); letter-spacing:3px; margin:10px 0; font-weight:800;}
   .overlay ol{text-align:left; margin:14px 0; padding-left:20px;}
   .overlay ol li{padding:4px 0;}
   .overlay button{margin-top:10px; padding:14px; width:100%; border-radius:12px; border:none; background:var(--accent); color:#0f172a; font-weight:800; font-size:16px; cursor:pointer;}
+  .choice-grid{display:grid; gap:10px; margin-top:14px;}
+  .choice-btn{
+    padding:16px; border-radius:12px; border:1px solid #334155;
+    background:#0f172a; color:var(--text);
+    font-size:18px; font-weight:800; cursor:pointer;
+    transition:transform .08s, border-color .15s;
+  }
+  .choice-btn:active{transform:scale(.98);}
+  .choice-btn:hover{border-color:var(--accent);}
+  .choice-timer{color:var(--muted); font-size:13px; margin-top:10px;}
   .players-strip{display:flex; gap:6px; padding:0 12px 6px; overflow-x:auto; background:var(--panel); scrollbar-width:none;}
   .players-strip::-webkit-scrollbar{display:none;}
   .pchip{flex:0 0 auto; background:#0f172a; border-radius:20px; padding:5px 11px; font-size:12px; display:flex; align-items:center; gap:6px; transition:box-shadow .15s;}
@@ -79,9 +90,9 @@
 
     <div class="side">
       <div class="toolbar" id="toolbar">
-        <!-- color swatches injected -->
         <button class="tool" id="eraserBtn">Eraser</button>
         <button class="tool" id="clearBtn">Clear</button>
+        <button class="tool warn" id="skipBtn" style="display:none;">Skip word</button>
         <input type="range" min="2" max="24" value="5" class="size" id="sizeRange" />
       </div>
       <div class="bottom">
@@ -107,9 +118,7 @@ const roomCode = (params.get('room') || '').toUpperCase();
 const name = sessionStorage.getItem('scribble_name') || 'Player';
 const playerId = localStorage.getItem('scribble_pid') || ('p_' + Math.random().toString(36).slice(2,10));
 
-if(!roomCode || !name){
-  location.href = '/';
-}
+if(!roomCode || !name){ location.href = '/'; }
 
 $('roomCode').textContent = roomCode;
 
@@ -121,18 +130,17 @@ let reconnectTimer = null;
 /* ---------------- State ---------------- */
 let isDrawer = false;
 let drawerId = null;
-let myScore = 0;
 let players = [];
-let currentWordMask = '';
 let roundEndsAt = 0;
 let timerInterval = null;
 let currentColor = '#111827';
 let currentSize = 5;
 let eraserOn = false;
 let lastPoint = null;
+let choiceTimerInterval = null;
 const COLORS = ['#111827','#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#78716c','#ffffff'];
 
-/* ---------------- Voice (WebRTC) ---------------- */
+/* ---------------- Voice ---------------- */
 let voice = null;
 const micBtn = $('micBtn');
 
@@ -192,16 +200,18 @@ function resizeCanvas(){
 }
 window.addEventListener('resize', resizeCanvas);
 
+function clearCanvas(){
+  const rect = canvas.getBoundingClientRect();
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, rect.width, rect.height);
+}
+
 function canvasPointFromEvent(ev){
   const rect = canvas.getBoundingClientRect();
   let cx, cy;
-  if(ev.touches && ev.touches[0]){
-    cx = ev.touches[0].clientX; cy = ev.touches[0].clientY;
-  }else if(ev.changedTouches && ev.changedTouches[0]){
-    cx = ev.changedTouches[0].clientX; cy = ev.changedTouches[0].clientY;
-  }else{
-    cx = ev.clientX; cy = ev.clientY;
-  }
+  if(ev.touches && ev.touches[0]){ cx = ev.touches[0].clientX; cy = ev.touches[0].clientY; }
+  else if(ev.changedTouches && ev.changedTouches[0]){ cx = ev.changedTouches[0].clientX; cy = ev.changedTouches[0].clientY; }
+  else { cx = ev.clientX; cy = ev.clientY; }
   return { x: cx - rect.left, y: cy - rect.top };
 }
 
@@ -215,12 +225,13 @@ function drawSegment(x0,y0,x1,y1,color,size,erase){
 }
 
 function strokeStart(ev){
-  if(!isDrawer){ return; }
+  if(!isDrawer) return;
   ev.preventDefault();
   lastPoint = canvasPointFromEvent(ev);
 }
+
 let lastSendTime = 0;
-const SEND_INTERVAL_MS = 16; // ~60Hz cap
+const SEND_INTERVAL_MS = 16;
 let pendingStroke = null;
 
 function strokeMove(ev){
@@ -230,17 +241,13 @@ function strokeMove(ev){
   const erase = eraserOn;
   const color = currentColor;
   const size = currentSize;
-  // Draw locally immediately (never blocked by network)
   drawSegment(lastPoint.x, lastPoint.y, p.x, p.y, color, size, erase);
-
-  // Coalesce network sends to one per frame
   pendingStroke = { type:'draw',
     x0:lastPoint.x, y0:lastPoint.y, x1:p.x, y1:p.y,
     color, size, erase };
   lastPoint = p;
 }
 
-// Flush on rAF — batches multiple pointermove events per frame
 function flushStroke(){
   if(pendingStroke && ws && ws.readyState === 1){
     const now = performance.now();
@@ -253,6 +260,7 @@ function flushStroke(){
   requestAnimationFrame(flushStroke);
 }
 requestAnimationFrame(flushStroke);
+
 function strokeEnd(ev){
   if(!isDrawer) return;
   if(ev) ev.preventDefault();
@@ -290,6 +298,10 @@ $('clearBtn').addEventListener('click', ()=>{
   if(!isDrawer) return;
   send({ type:'clear' });
 });
+$('skipBtn').addEventListener('click', ()=>{
+  if(!isDrawer) return;
+  send({ type:'skip_word' });
+});
 $('sizeRange').addEventListener('input', (e)=>{ currentSize = parseInt(e.target.value,10); });
 
 /* ---------------- Chat ---------------- */
@@ -299,6 +311,7 @@ function addChat(who, text, kind='chat', mine=false){
   div.className = 'msg ' + kind + (mine ? ' me' : '');
   if(kind === 'system') div.textContent = text;
   else if(kind === 'correct') div.textContent = text;
+  else if(kind === 'close') div.textContent = text;
   else div.innerHTML = `<span class="who">${escapeHtml(who)}:</span> ${escapeHtml(text)}`;
   chatlog.appendChild(div);
   chatlog.scrollTop = chatlog.scrollHeight;
@@ -317,7 +330,7 @@ function sendChat(){
   $('chatInput').value = '';
 }
 
-/* ---------------- Rendering: players, timer ---------------- */
+/* ---------------- Rendering ---------------- */
 function renderPlayers(){
   const strip = $('playersStrip');
   strip.innerHTML = '';
@@ -359,7 +372,6 @@ function connect(){
   ws.addEventListener('open', ()=>{
     send({ type:'join', name });
     if(voice) voice.ws = ws;
-    // Auto-resume mic if user had it on in lobby
     if(sessionStorage.getItem('scribble_mic') === '1'){
       if(!voice) initVoice();
       voice.ws = ws;
@@ -377,6 +389,16 @@ function connect(){
     if(reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, 1500);
   });
+}
+
+function setDrawerUI(active){
+  isDrawer = active;
+  $('clearBtn').style.display = active ? '' : 'none';
+  $('eraserBtn').style.display = active ? '' : 'none';
+  $('sizeRange').style.display = active ? '' : 'none';
+  $('skipBtn').style.display = active ? '' : 'none';
+  $('chatInput').placeholder = active ? 'You are drawing!' : 'Type your guess…';
+  $('chatInput').disabled = active;
 }
 
 function handle(msg){
@@ -397,29 +419,70 @@ function handle(msg){
     case 'room_state':
       players = msg.players;
       drawerId = msg.drawer_id;
-      $('roundNum').textContent = msg.round + 1;
-      $('roundTotal').textContent = msg.total_rounds;
+      if(msg.state !== 'choosing'){
+        $('roundNum').textContent = msg.round + 1;
+        $('roundTotal').textContent = msg.total_rounds;
+      }
       renderPlayers();
-      // keep voice mesh in sync with current players
       if(voice && voice.enabled) voice.setPeers(msg.players);
       break;
+
+    case 'choose_word': {
+      isDrawer = true;
+      drawerId = playerId;
+      $('roundNum').textContent = msg.round + 1;
+      $('roundTotal').textContent = msg.total_rounds;
+      $('wordDisplay').textContent = 'pick one!';
+      clearCanvas();
+      setDrawerUI(false); // don't show draw tools until they pick
+      const choices = msg.choices.map(w =>
+        `<button class="choice-btn" data-word="${escapeHtml(w)}">${escapeHtml(w)}</button>`
+      ).join('');
+      showOverlay(`
+        <h2>Pick a word</h2>
+        <div class="choice-grid">${choices}</div>
+        <div class="choice-timer" id="choiceTimer">15s</div>
+      `);
+      document.querySelectorAll('.choice-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const w = btn.dataset.word;
+          send({ type:'pick_word', word: w });
+          hideOverlay();
+        });
+      });
+      // countdown
+      if(choiceTimerInterval) clearInterval(choiceTimerInterval);
+      let remaining = 15;
+      choiceTimerInterval = setInterval(()=>{
+        remaining--;
+        const el = $('choiceTimer');
+        if(el) el.textContent = remaining + 's';
+        if(remaining <= 0){ clearInterval(choiceTimerInterval); hideOverlay(); }
+      }, 1000);
+      break;
+    }
+
+    case 'waiting_for_word': {
+      isDrawer = false;
+      drawerId = msg.drawer_id;
+      $('roundNum').textContent = msg.round + 1;
+      $('roundTotal').textContent = msg.total_rounds;
+      $('wordDisplay').textContent = 'waiting…';
+      setDrawerUI(false);
+      addChat('', `${msg.drawer_name} is choosing a word…`, 'system');
+      clearCanvas();
+      break;
+    }
+
     case 'round_start': {
-      isDrawer = !!msg.is_drawer;
+      if(choiceTimerInterval){ clearInterval(choiceTimerInterval); choiceTimerInterval = null; }
       drawerId = msg.drawer_id;
       roundEndsAt = msg.end_time;
       $('roundNum').textContent = (msg.round + 1);
       $('roundTotal').textContent = msg.total_rounds;
-      $('clearBtn').style.display = isDrawer ? '' : 'none';
-      $('eraserBtn').style.display = isDrawer ? '' : 'none';
-      $('sizeRange').style.display = isDrawer ? '' : 'none';
-      $('chatInput').placeholder = isDrawer ? 'You are drawing!' : 'Type your guess…';
-      $('chatInput').disabled = isDrawer;
-
-      ctx.fillStyle = '#ffffff';
-      const rect = canvas.getBoundingClientRect();
-      ctx.fillRect(0, 0, rect.width, rect.height);
-
-      if(isDrawer){
+      setDrawerUI(!!msg.is_drawer);
+      clearCanvas();
+      if(msg.is_drawer){
         $('wordDisplay').textContent = msg.word.toUpperCase();
         addChat('', `You are drawing: ${msg.word}`, 'system');
       }else{
@@ -429,23 +492,32 @@ function handle(msg){
       hideOverlay();
       break;
     }
-        case 'draw':
+
+    case 'hint':
+      $('wordDisplay').textContent = msg.masked;
+      break;
+
+    case 'draw':
       drawSegment(
         msg.x0, msg.y0, msg.x1, msg.y1,
-        msg.c ?? msg.color,     // server now sends short key 'c'
-        msg.s ?? msg.size,      //                    's'
-        msg.e ?? msg.erase      //                    'e'
+        msg.c ?? msg.color,
+        msg.s ?? msg.size,
+        msg.e ?? msg.erase
       );
       break;
-    case 'clear': {
-      ctx.fillStyle = '#ffffff';
-      const r = canvas.getBoundingClientRect();
-      ctx.fillRect(0, 0, r.width, r.height);
+
+    case 'clear':
+      clearCanvas();
       break;
-    }
+
     case 'chat':
       addChat(msg.name, msg.text, 'chat', msg.player_id === playerId);
       break;
+
+    case 'close_guess':
+      addChat('', `So close! "${msg.text}" is not quite right.`, 'close');
+      break;
+
     case 'correct_guess':
       players = msg.players;
       renderPlayers();
@@ -454,14 +526,19 @@ function handle(msg){
         $('wordDisplay').textContent = msg.word.toUpperCase();
       }
       break;
+
     case 'round_end': {
       if(timerInterval) clearInterval(timerInterval);
+      if(choiceTimerInterval){ clearInterval(choiceTimerInterval); choiceTimerInterval = null; }
       addChat('', `Round over. The word was "${msg.word}".`, 'system');
       $('wordDisplay').textContent = msg.word.toUpperCase();
+      setDrawerUI(false);
       break;
     }
+
     case 'game_over': {
       if(timerInterval) clearInterval(timerInterval);
+      if(choiceTimerInterval){ clearInterval(choiceTimerInterval); choiceTimerInterval = null; }
       players = msg.players;
       const sorted = [...players].sort((a,b)=> b.score - a.score);
       const rows = sorted.map((p,i)=>`<li>${i+1}. <b>${escapeHtml(p.name)}</b> — ${p.score}</li>`).join('');
@@ -475,10 +552,11 @@ function handle(msg){
       if(btn) btn.addEventListener('click', ()=>{ send({type:'play_again'}); hideOverlay(); });
       break;
     }
-    /* ---------- Voice signaling ---------- */
+
     case 'voice_signal':
       if(voice) voice.handleSignal(msg.from, msg.signal);
       break;
+
     case 'voice_activity': {
       const p = players.find(x => x.id === msg.player_id);
       if(p){ p._speaking = !!msg.speaking; renderPlayers(); }
@@ -489,10 +567,8 @@ function handle(msg){
 
 /* ---------------- Init ---------------- */
 resizeCanvas();
-connect();
-// Create voice instance immediately so micBtn works before ws opens
 initVoice();
-
+connect();
 window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch(e){} });
 </script>
 </body>
