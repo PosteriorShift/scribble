@@ -1,7 +1,6 @@
 """
-Scribble multiplayer game server — optimized for low latency.
-FastAPI + WebSockets. In-memory state, no database.
-Deploy on Render: uvicorn server:app --host 0.0.0.0 --port $PORT --ws websockets --loop uvloop
+Scribble multiplayer — Skribbl-level.
+FastAPI + WebSockets. In-memory. Render-ready.
 """
 from __future__ import annotations
 
@@ -18,7 +17,6 @@ from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-# ---- Optional uvloop (huge perf win on Linux; silently skipped on Windows) ----
 try:
     import uvloop  # type: ignore
     uvloop.install()
@@ -29,44 +27,48 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Scribble Game")
+app = FastAPI(title="Scribble")
 
-# Static with long cache (files are content-addressed enough for this game)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------------- Config ----------------
+# Grouped by difficulty so we can bias selection
 WORDS: tuple[str, ...] = (
-    "apple", "banana", "cat", "dog", "house", "tree", "car", "sun", "moon",
-    "star", "fish", "bird", "book", "chair", "table", "flower", "cloud",
-    "rain", "snow", "mountain", "river", "boat", "train", "plane", "rocket",
-    "pizza", "burger", "cake", "coffee", "guitar", "piano", "drum", "phone",
-    "computer", "camera", "clock", "gift", "heart", "smile", "ghost", "robot",
-    "dragon", "castle", "pirate", "ninja", "zombie", "rainbow", "volcano",
-    "elephant", "giraffe", "penguin", "dolphin", "butterfly", "spider",
-    "cactus", "island", "bridge", "lighthouse", "balloon", "kite", "snowman",
+    # easy / short
+    "cat", "dog", "sun", "moon", "star", "fish", "bird", "book", "chair",
+    "table", "tree", "car", "bus", "hat", "cup", "key", "egg", "ball",
+    "flower", "cloud", "rain", "snow", "boat", "train", "plane", "phone",
+    "pizza", "cake", "coffee", "clock", "gift", "heart", "smile", "ghost",
+    "robot", "dragon", "castle", "pirate", "ninja", "zombie", "rainbow",
+    "volcano", "cactus", "island", "bridge", "balloon", "kite", "snowman",
+    "apple", "banana", "burger", "guitar", "piano", "drum", "camera",
+    "rocket", "mountain", "river", "penguin", "dolphin", "butterfly",
+    "spider", "elephant", "giraffe", "lighthouse", "computer", "house",
 )
 
 MAX_PLAYERS = 10
 ROUND_SECONDS = 70
-ROUNDS_PER_GAME = 3
-INTERMISSION_SECONDS = 4
+INTERMISSION_SECONDS = 5
 DISCONNECT_GRACE_SECONDS = 30
 DRAW_BUFFER_MAX = 2000
+WORD_CHOICES_PER_ROUND = 3
+HINT_REVEAL_INTERVAL = 12   # seconds between revealed letters
+MIN_PLAYERS = 2             # ← 2 players is the happy path now
 
-# Pre-serialize separators for smaller/faster JSON
-_JSON_SEP = (",", ":")
+ALLOWED_ROUND_COUNTS = (3, 5, 7)
+
 _JSON_DUMPS = json.dumps
 
 
 def jd(obj) -> str:
-    return _JSON_DUMPS(obj, separators=_JSON_SEP, ensure_ascii=False)
+    return _JSON_DUMPS(obj, separators=(",", ":"), ensure_ascii=False)
 
 
-# ---------------- Data models ----------------
+# ---------------- Models ----------------
 class Player:
-    __slots__ = ("id", "name", "ws", "score", "connected")
+    __slots__ = ("id", "name", "ws", "score", "connected", "is_host")
 
     def __init__(self, pid: str, name: str, ws: WebSocket):
         self.id = pid
@@ -74,6 +76,7 @@ class Player:
         self.ws = ws
         self.score = 0
         self.connected = True
+        self.is_host = False
 
     def to_public(self, host_id: Optional[str]) -> dict:
         return {
@@ -89,27 +92,33 @@ class Room:
     __slots__ = (
         "code", "players", "host_id", "state", "round", "total_rounds",
         "drawer_order", "drawer_index", "current_word", "round_end_time",
-        "timer_task", "cleanup_tasks", "correct_guessers", "drawing_events",
+        "round_start_time", "timer_task", "cleanup_tasks", "correct_guessers",
+        "drawing_events", "word_pool", "revealed_indices", "last_hint_time",
+        "word_choices", "awaiting_choice",
     )
 
     def __init__(self, code: str):
         self.code = code
         self.players: Dict[str, Player] = {}
         self.host_id: Optional[str] = None
-        self.state = "lobby"           # lobby | drawing | intermission | ended
+        self.state = "lobby"           # lobby | choosing | drawing | intermission | ended
         self.round = 0
-        self.total_rounds = ROUNDS_PER_GAME
+        self.total_rounds = 3
         self.drawer_order: List[str] = []
         self.drawer_index = 0
         self.current_word: Optional[str] = None
         self.round_end_time: float = 0.0
+        self.round_start_time: float = 0.0
         self.timer_task: Optional[asyncio.Task] = None
         self.cleanup_tasks: Set[asyncio.Task] = set()
         self.correct_guessers: Set[str] = set()
-        # ring buffer — no reallocation, bounded memory
         self.drawing_events: deque = deque(maxlen=DRAW_BUFFER_MAX)
+        self.word_pool: List[str] = []       # shuffled bag, no repeats
+        self.revealed_indices: Set[int] = set()   # hint system
+        self.last_hint_time: float = 0.0
+        self.word_choices: List[str] = []
+        self.awaiting_choice: Optional[str] = None   # drawer id who must pick
 
-    # ---- player helpers ----
     def add_player(self, player: Player) -> bool:
         if len(self.players) >= MAX_PLAYERS:
             return False
@@ -135,14 +144,19 @@ class Room:
         host = self.host_id
         return [p.to_public(host) for p in self.players.values()]
 
-    def reset_for_new_game(self):
+    def reset_for_new_game(self, rounds: int):
         self.round = 0
+        self.total_rounds = rounds if rounds in ALLOWED_ROUND_COUNTS else 3
         self.state = "lobby"
         self.drawer_order = []
         self.drawer_index = 0
         self.current_word = None
         self.correct_guessers.clear()
         self.drawing_events.clear()
+        self.word_pool = []
+        self.revealed_indices.clear()
+        self.word_choices = []
+        self.awaiting_choice = None
         for p in self.players.values():
             p.score = 0
 
@@ -151,8 +165,18 @@ class Room:
             return self.drawer_order[self.drawer_index]
         return None
 
+    def next_word_choices(self, n: int = WORD_CHOICES_PER_ROUND) -> List[str]:
+        """Pull n distinct words from the shuffled bag. Refill when empty."""
+        if len(self.word_pool) < n:
+            fresh = list(WORDS)
+            random.shuffle(fresh)
+            self.word_pool.extend(fresh)
+        picks = []
+        for _ in range(n):
+            picks.append(self.word_pool.pop())
+        return picks
 
-# ---------------- Room manager ----------------
+
 class RoomManager:
     __slots__ = ("rooms",)
 
@@ -191,7 +215,46 @@ class RoomManager:
 manager = RoomManager()
 
 
-# ---------------- Broadcast (parallel, fire-and-forget) ----------------
+# ---------------- Helpers ----------------
+def mask_word(word: str, revealed: Set[int]) -> str:
+    """Render 'c _ t' style with some letters revealed via hints."""
+    out = []
+    for i, ch in enumerate(word):
+        if ch == " ":
+            out.append(" ")
+        elif i in revealed:
+            out.append(ch)
+        else:
+            out.append("_")
+    return " ".join(out)
+
+
+def is_close_guess(guess: str, word: str) -> bool:
+    """Levenshtein distance ≤ 1 → 'so close!'"""
+    if guess == word:
+        return False
+    if abs(len(guess) - len(word)) > 1:
+        return False
+    # simple 1-edit distance check
+    if len(guess) == len(word):
+        diffs = sum(1 for a, b in zip(guess, word) if a != b)
+        return diffs == 1
+    # one insertion/deletion
+    s, t = (guess, word) if len(guess) < len(word) else (word, guess)
+    i = j = 0
+    skipped = False
+    while i < len(s) and j < len(t):
+        if s[i] == t[j]:
+            i += 1
+            j += 1
+        else:
+            if skipped:
+                return False
+            skipped = True
+            j += 1
+    return True
+
+
 async def send_json(ws: WebSocket, data: dict):
     try:
         await ws.send_text(jd(data))
@@ -200,7 +263,6 @@ async def send_json(ws: WebSocket, data: dict):
 
 
 async def _try_send(p: Player, payload: str) -> Optional[str]:
-    """Return player id if send failed, else None."""
     try:
         await p.ws.send_text(payload)
         return None
@@ -210,17 +272,15 @@ async def _try_send(p: Player, payload: str) -> Optional[str]:
 
 
 async def broadcast(room: Room, data: dict, exclude: Optional[Set[str]] = None):
-    """Serialize once, send in parallel. Marks dead peers disconnected."""
     payload = jd(data)
-    tasks: List[asyncio.Task] = []
-    players = room.players
+    tasks = []
     if exclude:
-        for pid, p in players.items():
+        for pid, p in room.players.items():
             if pid in exclude or not p.connected:
                 continue
             tasks.append(asyncio.create_task(_try_send(p, payload)))
     else:
-        for p in players.values():
+        for p in room.players.values():
             if not p.connected:
                 continue
             tasks.append(asyncio.create_task(_try_send(p, payload)))
@@ -240,13 +300,8 @@ def room_state_payload(room: Room) -> dict:
         "drawer_id": room.current_drawer_id(),
         "word_length": len(room.current_word) if room.current_word else 0,
         "round_end_time": room.round_end_time,
+        "round_start_time": room.round_start_time,
     }
-
-
-def masked_word(word: Optional[str]) -> str:
-    if not word:
-        return ""
-    return " ".join("_" if c != " " else " " for c in word)
 
 
 async def broadcast_room_state(room: Room):
@@ -255,11 +310,30 @@ async def broadcast_room_state(room: Room):
 
 # ---------------- Round / timer ----------------
 async def run_round_timer(room: Room):
-    """Single precise sleep — no per-second polling."""
+    """Precise sleep + hint revealer."""
     try:
-        remaining = room.round_end_time - time.time()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+        while room.state == "drawing":
+            now = time.time()
+            remaining = room.round_end_time - now
+            if remaining <= 0:
+                break
+            # hint reveal based on elapsed time
+            if room.current_word:
+                elapsed = now - room.round_start_time
+                target_reveals = int(elapsed / HINT_REVEAL_INTERVAL)
+                # reveal this many letters (excluding first — Skribbl keeps first visible)
+                if target_reveals > len(room.revealed_indices):
+                    hidden = [i for i in range(len(room.current_word))
+                              if i not in room.revealed_indices and room.current_word[i] != " "]
+                    if hidden:
+                        idx = random.choice(hidden)
+                        room.revealed_indices.add(idx)
+                        room.last_hint_time = now
+                        await broadcast(room, {
+                            "type": "hint",
+                            "masked": mask_word(room.current_word, room.revealed_indices),
+                        })
+            await asyncio.sleep(min(1.0, remaining))
         if room.state == "drawing":
             await end_round(room)
     except asyncio.CancelledError:
@@ -268,7 +342,101 @@ async def run_round_timer(room: Room):
         print(f"[timer] room={room.code} err={exc}")
 
 
+async def prompt_drawer_for_word(room: Room):
+    """Ask the current drawer to pick from 3 choices."""
+    drawer_id = room.current_drawer_id()
+    drawer = room.players.get(drawer_id) if drawer_id else None
+    if not drawer or not drawer.connected:
+        # drawer gone → advance
+        await start_round(room)
+        return
+
+    room.word_choices = room.next_word_choices(WORD_CHOICES_PER_ROUND)
+    room.awaiting_choice = drawer_id
+    room.state = "choosing"
+    room.revealed_indices.clear()
+    room.current_word = None
+
+    await send_json(drawer.ws, {
+        "type": "choose_word",
+        "choices": room.word_choices,
+        "round": room.round,
+        "total_rounds": room.total_rounds,
+        "end_time": time.time() + 15,   # 15s to pick or auto-pick
+    })
+
+    await broadcast(room, {
+        "type": "waiting_for_word",
+        "drawer_id": drawer_id,
+        "drawer_name": drawer.name,
+        "round": room.round,
+        "total_rounds": room.total_rounds,
+    }, exclude={drawer_id})
+
+    await broadcast_room_state(room)
+
+    # auto-pick after 15s if drawer is silent
+    asyncio.create_task(auto_pick_word(room, drawer_id, room.word_choices[:]))
+
+
+async def auto_pick_word(room: Room, drawer_id: str, choices: List[str]):
+    await asyncio.sleep(15)
+    if (room.state == "choosing"
+            and room.awaiting_choice == drawer_id
+            and room.word_choices == choices):
+        # auto pick the first
+        await begin_drawing(room, choices[0], drawer_id)
+
+
+async def begin_drawing(room: Room, word: str, drawer_id: str):
+    if room.awaiting_choice != drawer_id and room.current_word:
+        return  # already started
+
+    room.current_word = word
+    room.awaiting_choice = None
+    room.revealed_indices.clear()
+    room.correct_guessers.clear()
+    room.drawing_events.clear()
+    room.round_start_time = time.time()
+    room.round_end_time = room.round_start_time + ROUND_SECONDS
+    room.state = "drawing"
+
+    drawer_id = room.current_drawer_id()
+    word = room.current_word
+    masked = mask_word(word, room.revealed_indices)
+    end_time = room.round_end_time
+    start_time = room.round_start_time
+    rnd = room.round
+    trnd = room.total_rounds
+
+    tasks = []
+    for pid, p in room.players.items():
+        if not p.connected:
+            continue
+        msg = {
+            "type": "round_start",
+            "word": word if pid == drawer_id else masked,
+            "is_drawer": pid == drawer_id,
+            "drawer_id": drawer_id,
+            "round": rnd,
+            "total_rounds": trnd,
+            "end_time": end_time,
+            "start_time": start_time,
+            "duration": ROUND_SECONDS,
+        }
+        tasks.append(asyncio.create_task(send_json(p.ws, msg)))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    await broadcast_room_state(room)
+
+    if room.timer_task and not room.timer_task.done():
+        room.timer_task.cancel()
+    room.timer_task = asyncio.create_task(run_round_timer(room))
+
+
 async def start_round(room: Room):
+    """Advance drawer_index and either prompt for word or end game."""
     if room.timer_task and not room.timer_task.done():
         room.timer_task.cancel()
     room.timer_task = None
@@ -290,41 +458,28 @@ async def start_round(room: Room):
             return
         room.drawer_index = 0
 
-    room.correct_guessers.clear()
-    room.drawing_events.clear()
-    room.current_word = random.choice(WORDS)
-    room.round_end_time = time.time() + ROUND_SECONDS
-    room.state = "drawing"
+    # drawer may have disconnected — skip them
+    guard = 0
+    while room.drawer_index < len(room.drawer_order) and guard < len(room.drawer_order) + 1:
+        did = room.drawer_order[room.drawer_index]
+        p = room.players.get(did)
+        if p and p.connected:
+            break
+        room.drawer_index += 1
+        if room.drawer_index >= len(room.drawer_order):
+            room.round += 1
+            if room.round >= room.total_rounds:
+                room.state = "ended"
+                await broadcast(room, {
+                    "type": "game_over",
+                    "players": room.public_players(),
+                })
+                await broadcast_room_state(room)
+                return
+            room.drawer_index = 0
+        guard += 1
 
-    drawer_id = room.current_drawer_id()
-    word = room.current_word
-    masked = masked_word(word)
-    end_time = room.round_end_time
-    rnd = room.round
-    trnd = room.total_rounds
-
-    # Per-player payloads: drawer sees word, others see mask.
-    # Send in parallel.
-    tasks: List[asyncio.Task] = []
-    for pid, p in room.players.items():
-        if not p.connected:
-            continue
-        msg = {
-            "type": "round_start",
-            "word": word if pid == drawer_id else masked,
-            "is_drawer": pid == drawer_id,
-            "drawer_id": drawer_id,
-            "round": rnd,
-            "total_rounds": trnd,
-            "end_time": end_time,
-            "duration": ROUND_SECONDS,
-        }
-        tasks.append(asyncio.create_task(send_json(p.ws, msg)))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    await broadcast_room_state(room)
-    room.timer_task = asyncio.create_task(run_round_timer(room))
+    await prompt_drawer_for_word(room)
 
 
 async def end_round(room: Room):
@@ -339,7 +494,6 @@ async def end_round(room: Room):
         "players": room.public_players(),
     })
 
-    # advance drawer
     room.drawer_index += 1
     if room.drawer_index >= len(room.drawer_order):
         room.round += 1
@@ -363,7 +517,7 @@ async def end_round(room: Room):
         await start_round(room)
 
 
-# ---------------- HTTP routes ----------------
+# ---------------- HTTP ----------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -399,26 +553,17 @@ async def favicon():
 @app.websocket("/ws/{room_code}/{player_id}")
 async def ws_endpoint(ws: WebSocket, room_code: str, player_id: str):
     await ws.accept()
-
-    # Bigger receive buffer helps with rapid draw streams
-    try:
-        await ws.send_text("")  # noop, ensures write path ready
-    except Exception:
-        pass
-
     room = manager.get_room(room_code)
     if not room:
         await send_json(ws, {"type": "error", "message": "Room not found"})
         await ws.close()
         return
 
-    # ---- Reconnect path ----
     existing = room.players.get(player_id)
     if existing:
         old_ws = existing.ws
         existing.ws = ws
         existing.connected = True
-        # Cancel any pending cleanup for this player
         for ct in list(room.cleanup_tasks):
             if ct.done():
                 room.cleanup_tasks.discard(ct)
@@ -429,27 +574,31 @@ async def ws_endpoint(ws: WebSocket, room_code: str, player_id: str):
             pass
         await send_json(ws, {"type": "welcome_back", "player_id": player_id})
         await broadcast_room_state(room)
+        # if we're waiting for this player's word choice, re-send it
+        if room.state == "choosing" and room.awaiting_choice == player_id:
+            await send_json(ws, {
+                "type": "choose_word",
+                "choices": room.word_choices,
+                "round": room.round,
+                "total_rounds": room.total_rounds,
+            })
     else:
-        # ---- First connect: wait for join ----
         try:
             raw = await ws.receive_text()
             data = json.loads(raw)
         except Exception:
             await ws.close()
             return
-
         if data.get("type") != "join":
             await send_json(ws, {"type": "error", "message": "Expected join"})
             await ws.close()
             return
-
         name = (data.get("name") or "").strip()[:20] or "Player"
         player = Player(player_id, name, ws)
         if not room.add_player(player):
             await send_json(ws, {"type": "error", "message": "Room is full"})
             await ws.close()
             return
-
         await send_json(ws, {
             "type": "welcome",
             "player_id": player_id,
@@ -458,7 +607,6 @@ async def ws_endpoint(ws: WebSocket, room_code: str, player_id: str):
         await broadcast(room, {"type": "system", "message": f"{name} joined"})
         await broadcast_room_state(room)
 
-    # ---- Message loop ----
     try:
         while True:
             raw = await ws.receive_text()
@@ -496,11 +644,12 @@ async def cleanup_later(room: Room, pid: str):
     p = room.players.get(pid)
     if p and not p.connected:
         was_drawer = (room.current_drawer_id() == pid)
+        was_choosing = (room.awaiting_choice == pid)
         room.remove_player(pid)
         if room.host_id is None and room.players:
             room.host_id = next(iter(room.players))
         await broadcast_room_state(room)
-        if was_drawer and room.state in ("drawing", "intermission"):
+        if (was_drawer or was_choosing) and room.state in ("drawing", "choosing", "intermission"):
             await end_round(room)
     manager.cleanup_room(room)
 
@@ -510,6 +659,16 @@ async def handle_message(room: Room, pid: str, msg: dict):
     mtype = msg.get("type")
     player = room.players.get(pid)
     if not player:
+        return
+
+    # ---------- WORD CHOICE (drawer only) ----------
+    if mtype == "pick_word":
+        if room.state != "choosing" or room.awaiting_choice != pid:
+            return
+        word = (msg.get("word") or "").strip()
+        if word not in room.word_choices:
+            return
+        await begin_drawing(room, word, pid)
         return
 
     # ---------- CHAT / GUESS ----------
@@ -525,12 +684,12 @@ async def handle_message(room: Room, pid: str, msg: dict):
 
         if is_guess_phase and pid not in room.correct_guessers:
             guess = text.casefold()
-            if guess == room.current_word.casefold():
-                # ---- Correct guess ----
+            word_cf = room.current_word.casefold()
+
+            if guess == word_cf:
+                # ---- Correct ----
                 room.correct_guessers.add(pid)
-                time_left = room.round_end_time - time.time()
-                if time_left < 0:
-                    time_left = 0.0
+                time_left = max(0.0, room.round_end_time - time.time())
                 pts = int(50 + 100 * (time_left / ROUND_SECONDS))
                 player.score += pts
 
@@ -547,7 +706,7 @@ async def handle_message(room: Room, pid: str, msg: dict):
                     "players": room.public_players(),
                 })
 
-                # End early if every connected non-drawer has guessed
+                # end early if all connected non-drawers guessed
                 all_done = True
                 for p_id, p in room.players.items():
                     if p_id == drawer_id or not p.connected:
@@ -555,14 +714,21 @@ async def handle_message(room: Room, pid: str, msg: dict):
                     if p_id not in room.correct_guessers:
                         all_done = False
                         break
-
                 if all_done:
                     await end_round(room)
                 else:
                     await broadcast_room_state(room)
                 return
 
-        # ---- Normal chat ----
+            # ---- close guess ----
+            if is_close_guess(guess, word_cf):
+                await send_json(player.ws, {
+                    "type": "close_guess",
+                    "text": text,
+                })
+                return
+
+        # ---- normal chat ----
         await broadcast(room, {
             "type": "chat",
             "player_id": pid,
@@ -576,7 +742,6 @@ async def handle_message(room: Room, pid: str, msg: dict):
     if mtype == "draw":
         if room.state != "drawing" or pid != room.current_drawer_id():
             return
-        # Compact draw event (short keys reduce payload ~30%)
         evt = {
             "type": "draw",
             "x0": msg.get("x0"), "y0": msg.get("y0"),
@@ -597,17 +762,40 @@ async def handle_message(room: Room, pid: str, msg: dict):
         await broadcast(room, {"type": "clear"}, exclude={pid})
         return
 
+    # ---------- SKIP (drawer gives up) ----------
+    if mtype == "skip_word":
+        if room.state != "drawing" or pid != room.current_drawer_id():
+            return
+        await broadcast(room, {
+            "type": "system",
+            "message": f"{player.name} skipped the word: {room.current_word}",
+        })
+        await end_round(room)
+        return
+
+    # ---------- SET ROUNDS (host, lobby only) ----------
+    if mtype == "set_rounds":
+        if pid != room.host_id or room.state != "lobby":
+            return
+        n = int(msg.get("rounds") or 3)
+        if n not in ALLOWED_ROUND_COUNTS:
+            n = 3
+        room.total_rounds = n
+        await broadcast_room_state(room)
+        return
+
     # ---------- START GAME ----------
     if mtype == "start_game":
         if pid != room.host_id or room.state != "lobby":
             return
-        if len(room.players) < 2:
+        if len(room.players) < MIN_PLAYERS:
             await send_json(player.ws, {
                 "type": "error",
-                "message": "Need at least 2 players",
+                "message": f"Need at least {MIN_PLAYERS} players",
             })
             return
-        room.reset_for_new_game()
+        rounds = int(msg.get("rounds") or room.total_rounds or 3)
+        room.reset_for_new_game(rounds)
         room.drawer_order = list(room.players.keys())
         random.shuffle(room.drawer_order)
         room.drawer_index = 0
@@ -621,11 +809,11 @@ async def handle_message(room: Room, pid: str, msg: dict):
     if mtype == "play_again":
         if pid != room.host_id or room.state != "ended":
             return
-        room.reset_for_new_game()
+        room.reset_for_new_game(room.total_rounds)
         await broadcast_room_state(room)
         return
 
-    # ---------- VOICE SIGNALING ----------
+    # ---------- VOICE ----------
     if mtype == "voice_signal":
         target = msg.get("target")
         if target:
